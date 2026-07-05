@@ -1,0 +1,31 @@
+[project]
+name = "screenarr"
+version = "0.1.0"
+description = "Arr-compatible bridge that lets OnScreen requests dispatch to MediaManager."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "OnScreen MediaManager Bridge contributors" }]
+dependencies = [
+  "fastapi>=0.115.0",
+  "httpx>=0.27.0",
+  "pydantic-settings>=2.5.0",
+  "pyyaml>=6.0.2",
+  "uvicorn[standard]>=0.30.0"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2.0",
+  "ruff>=0.5.0"
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

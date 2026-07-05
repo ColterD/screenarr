@@ -1,0 +1,3 @@
+{"type":"status","message":"review started"}
+not json
+{"type":"finding","severity":"minor","message":"style nit"}

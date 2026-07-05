@@ -1,0 +1,35 @@
+services:
+  screenarr:
+    image: screenarr:latest
+    build: .
+    container_name: screenarr
+    restart: unless-stopped
+    environment:
+      BRIDGE_API_KEY: "change-this"
+      MEDIAMANAGER_BASE_URL: "http://host.docker.internal:8000"
+      MEDIAMANAGER_USERNAME: ""
+      MEDIAMANAGER_PASSWORD: ""
+      MEDIAMANAGER_TOKEN: ""
+      MEDIAMANAGER_TIMEOUT_SECONDS: "120"
+      CONFIG_PATH: "/config/config.yaml"
+      LOG_LEVEL: "info"
+      ENABLE_DASHBOARD: "false"
+      DASHBOARD_SESSION_SECRET: ""
+      SCREENARR_DATA_PATH: "/data/screenarr.db"
+      ENABLE_ONSCREEN_WEBHOOK: "false"
+      ONSCREEN_WEBHOOK_SECRET: ""
+      ENABLE_MEDIAMANAGER_RECONCILE: "false"
+      MEDIAMANAGER_RECONCILE_INTERVAL_SECONDS: "300"
+      MEDIAMANAGER_CONFIG_PATH: "" # Set to /config/mediamanager.toml when using the mount below.
+    ports:
+      - "127.0.0.1:7879:7879"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - screenarr_data:/data
+      # Optional: mount MediaManager config read-only for ruleset drift checks.
+      # - /path/to/MediaManager/config.toml:/config/mediamanager.toml:ro
+
+volumes:
+  screenarr_data:

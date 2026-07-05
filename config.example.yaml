@@ -1,0 +1,46 @@
+# Profiles are presented to OnScreen as Arr quality profiles.
+# Prefer TRaSH / Profilarr naming here; the bridge maps that terminology into
+# MediaManager libraries and scoring rulesets.
+# The sample TRaSH URLs are general setup references; use trash_profile_id as
+# the profile-specific display key until you replace these with your own links.
+profiles:
+  - id: 101
+    name: "TRaSH: HD Bluray + WEB 1080p"
+    media_types: ["movie", "show"]
+    mode: "auto"
+    mediamanager_library: "Default"
+    mediamanager_ruleset: "default"
+    score_set: "default"
+    trash_profile_id: "hd-bluray-web-1080p"
+    trash_profile_url: "https://trash-guides.info/Radarr/radarr-setup-quality-profiles/"
+    trash_custom_format_group_ids: []
+    profilarr_profile_id: null
+    max_results: 10
+  - id: 2160
+    name: "TRaSH: UHD Bluray + WEB 2160p"
+    media_types: ["movie", "show"]
+    mode: "manual"
+    mediamanager_library: "4K"
+    mediamanager_ruleset: "strict_quality"
+    score_set: "uhd"
+    trash_profile_id: "uhd-bluray-web-2160p"
+    trash_profile_url: "https://trash-guides.info/Radarr/radarr-setup-quality-profiles/"
+    trash_custom_format_group_ids: []
+    profilarr_profile_id: null
+    max_results: 10
+
+# Root folders are compatibility labels for OnScreen's Arr setup UI.
+# MediaManager chooses real folders from its own library config.
+root_folders:
+  - id: 1
+    path: "Default"
+    free_space: 0
+  - id: 2
+    path: "4K"
+    free_space: 0
+
+tags:
+  - id: 1
+    label: "onscreen"
+  - id: 2
+    label: "mediamanager"
