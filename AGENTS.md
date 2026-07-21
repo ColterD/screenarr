@@ -94,16 +94,14 @@ python -m ruff check .
 python -m pytest
 docker build -t screenarr:local .
 powershell -ExecutionPolicy Bypass -File scripts/review-gate.ps1 -CodexReviewConfirmed
-coderabbit review --agent -t uncommitted -c AGENTS.md
 ```
 
-If the native CodeRabbit CLI is not available on Windows, use the review gate's
-Docker runner with a local-only `CODERABBIT_API_KEY` environment variable:
-
-```powershell
-$env:CODERABBIT_API_KEY = "<local key>"
-powershell -ExecutionPolicy Bypass -File scripts/review-gate.ps1 -CodexReviewConfirmed -CodeRabbitRunner docker
-```
+The review gate is a thin adapter to the central CodeRabbit runner configured
+via the gate's `-CentralCodeRabbitRunner` parameter (default: a central checkout
+outside this repo). That central runner is the only CodeRabbit invocation owner;
+it selects the explicit uncommitted scope, enforces quota and replay policy, and
+uses the authenticated Debian CLI without repository credentials or Docker
+fallbacks.
 
 ## REVIEW GUIDELINES
 

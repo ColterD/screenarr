@@ -18,6 +18,15 @@ def issue(code: str, message: str, severity: str = "warning") -> dict[str, str]:
 
 def validate_static_config(config: BridgeConfig, settings: Settings) -> list[dict[str, str]]:
     issues: list[dict[str, str]] = []
+    if settings.trust_forwarded_headers:
+        issues.append(
+            issue(
+                "settings.trust_forwarded_headers",
+                "TRUST_FORWARDED_HEADERS is enabled; only enable it behind a "
+                "trusted reverse proxy that sanitizes X-Forwarded-* headers",
+                "warning",
+            )
+        )
     for profile in config.profiles:
         if not profile.media_types:
             issues.append(

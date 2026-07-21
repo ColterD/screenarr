@@ -23,6 +23,7 @@ MEDIAMANAGER_PASSWORD=
 MEDIAMANAGER_TOKEN=
 ENABLE_DASHBOARD=false
 DASHBOARD_SESSION_SECRET=
+TRUST_FORWARDED_HEADERS=false
 SCREENARR_DATA_PATH=/data/screenarr.db
 ENABLE_ONSCREEN_WEBHOOK=false
 ONSCREEN_WEBHOOK_SECRET=
@@ -110,6 +111,12 @@ the dashboard disabled by default.
 Set `DASHBOARD_SESSION_SECRET` to a high-entropy value at least 32 characters
 long if dashboard sessions should survive container restarts. If it is blank,
 Screenarr generates one and persists it in the SQLite state file.
+
+Leave `TRUST_FORWARDED_HEADERS=false` when the bridge is exposed directly.
+Set it to `true` only behind a trusted reverse proxy that terminates TLS and
+sets (or sanitizes) `X-Forwarded-Host` and `X-Forwarded-Proto`; the dashboard
+then derives the expected CSRF origin and the session-cookie `Secure` flag
+from those headers.
 
 Local browser testing can use the login page:
 

@@ -1,16 +1,44 @@
-FROM python:3.12-slim AS runtime
+# Pinned uv distribution image; provides /uv and /uvx only.
+# Digests are refreshed automatically by Dependabot (see .github/dependabot.yml).
+FROM ghcr.io/astral-sh/uv:0.11.30@sha256:93b61e21202b1dab861092748e46bbd6e0e41dd84f59b9174efd2353186e1b47 AS uv
+
+FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    PATH="/app/.venv/bin:$PATH"
 
 WORKDIR /app
 
-COPY pyproject.toml README.md ./
-COPY bridge ./bridge
+COPY --from=uv /uv /uvx /bin/
 
-RUN pip install .
+# Install locked third-party dependencies first so this layer caches
+# independently of application source changes.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --no-dev --no-install-project
+
+# Install the project itself from the same lockfile resolution.
+COPY README.md ./
+COPY bridge ./bridge
+RUN uv sync --locked --no-dev
+
+# Run as a dedicated non-root user. /data holds the SQLite state file
+# (SCREENARR_DATA_PATH, default /data/screenarr.db), so it must be writable.
+# /app stays root-owned: the runtime user gets no write access to the
+# application code or virtual environment.
+RUN groupadd --system screenarr \
+    && useradd --system --gid screenarr --no-create-home screenarr \
+    && mkdir -p /data \
+    && chown -R screenarr:screenarr /data
+
+USER screenarr
 
 EXPOSE 7879
+
+# Slim images ship no curl; probe the health endpoint with Python stdlib.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7879/healthz', timeout=3)"]
 
 CMD ["uvicorn", "bridge.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "7879"]

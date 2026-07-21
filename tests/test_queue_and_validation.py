@@ -33,6 +33,7 @@ from bridge.main import (
     mark_download_failed,
     mediamanager_reconcile_loop,
     mediamanager_reconcile_summary,
+    mediamanager_reports_grab_activity,
     parse_webhook_int,
     record_auto_download_unverified,
     refresh_candidates_for_item,
@@ -40,7 +41,7 @@ from bridge.main import (
     validate_live_libraries,
 )
 from bridge.mediamanager import MediaManagerError, ReleaseChoice
-from bridge.security import verify_dashboard_session, verify_onscreen_signature
+from bridge.security import LoginThrottle, verify_dashboard_session, verify_onscreen_signature
 from bridge.store import BridgeStore
 from bridge.validation import numeric_score, validate_static_config
 
@@ -117,6 +118,8 @@ class FakeMediaManager:
     ) -> dict[str, Any]:
         self.raise_next_download_failure()
         self.downloaded_movies.append(result_id)
+        # A successful grab shows up as active download activity on the detail.
+        self.movie_detail = {**self.movie_detail, "downloading": True}
         return {"id": "torrent-uuid"}
 
     async def get_movie(self, movie_uuid: str) -> dict[str, Any]:
@@ -147,6 +150,8 @@ class FakeMediaManager:
     async def download_show_torrent(self, show_uuid: str, result_id: str) -> dict[str, Any]:
         self.raise_next_download_failure()
         self.downloaded_shows.append(result_id)
+        # A successful grab shows up as active download activity on the detail.
+        self.show_detail = {**self.show_detail, "downloading": True}
         return {"id": "torrent-uuid"}
 
     async def get_show(self, show_uuid: str) -> dict[str, Any]:
@@ -368,10 +373,11 @@ def make_flow_client(
     profile: BridgeProfile,
     *,
     mediamanager: FakeMediaManager | None = None,
+    **settings_overrides: Any,
 ) -> tuple[TestClient, FakeMediaManager]:
     fake = mediamanager or FakeMediaManager()
     app = create_app(
-        settings=settings_for(path, ENABLE_DASHBOARD=True),
+        settings=settings_for(path, ENABLE_DASHBOARD=True, **settings_overrides),
         config=BridgeConfig(profiles=[profile]),
         mediamanager_factory=lambda _settings: fake,
     )
@@ -1691,7 +1697,10 @@ def test_show_reconcile_requires_requested_season_completion(tmp_path: Path) -> 
         fake.show_detail = {
             "id": "show-uuid",
             "downloaded": True,
-            "seasons": [{"season_number": 2, "downloaded": True}],
+            "seasons": [
+                {"season_number": 1, "downloading": True},
+                {"season_number": 2, "downloaded": True},
+            ],
         }
         reconciled = client.post(
             f"/api/bridge/v1/queue/{item['id']}/reconcile",
@@ -2270,6 +2279,8 @@ async def test_background_reconcile_does_not_churn_noop_events(
         mediamanager_id="movie-uuid",
     )
     fake = FakeMediaManager()
+    # An in-progress grab keeps the noop reconcile from churning events.
+    fake.movie_detail = {"id": "movie-uuid", "downloaded": False, "downloading": True}
 
     stop_background_reconcile_after_iterations(monkeypatch)
 
@@ -2710,7 +2721,9 @@ def test_dashboard_post_actions_require_same_origin(tmp_path: Path) -> None:
     assert missing_origin.status_code == 403
     assert bad_origin.status_code == 403
     assert good_origin.status_code == 303
-    assert forwarded_proto_origin.status_code == 303
+    # Forwarded headers are not trusted by default, so the https origin no
+    # longer matches the plain-http request URL.
+    assert forwarded_proto_origin.status_code == 403
     assert host_only_proxy_origin.status_code == 403
 
 
@@ -3489,3 +3502,798 @@ def test_static_mediamanager_ruleset_validation(tmp_path: Path) -> None:
         item["code"] for item in cross_duplicate_rule_issues
     }
     assert "ruleset.duplicate_scoring_rule_name" in cross_duplicate_rule_codes
+
+
+def test_trust_forwarded_headers_setting_defaults_off(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path / "screenarr.db")
+    trusted = settings_for(tmp_path / "trusted.db", TRUST_FORWARDED_HEADERS=True)
+
+    assert not settings.trust_forwarded_headers
+    assert trusted.trust_forwarded_headers
+
+
+def seed_submitted_movie_item(client: TestClient, mediamanager_id: str) -> dict[str, Any]:
+    return client.app.state.store.upsert_queue_item(
+        media_type="movie",
+        external_id=550,
+        title="Fight Club",
+        profile_id=101,
+        profile_name="Manual",
+        mode="manual",
+        status="download_submitted",
+        mediamanager_id=mediamanager_id,
+    )
+
+
+def test_dashboard_csrf_rejects_spoofed_forwarded_headers_by_default(
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        settings=settings_for(tmp_path / "screenarr.db", ENABLE_DASHBOARD=True),
+        config=BridgeConfig(),
+        mediamanager_factory=lambda _settings: SelectiveDetailMediaManager(),
+    )
+
+    with TestClient(app) as client:
+        item = seed_submitted_movie_item(client, "movie-ok")
+        url = f"/dashboard/queue/{item['id']}/reconcile"
+        spoofed = client.post(
+            url,
+            headers={
+                "X-Api-Key": "test",
+                "Origin": "https://media.example.com",
+                "X-Forwarded-Host": "media.example.com",
+                "X-Forwarded-Proto": "https",
+            },
+            follow_redirects=False,
+        )
+
+    assert spoofed.status_code == 403
+
+
+def test_dashboard_csrf_accepts_forwarded_origin_when_trusted(tmp_path: Path) -> None:
+    app = create_app(
+        settings=settings_for(
+            tmp_path / "screenarr.db",
+            ENABLE_DASHBOARD=True,
+            TRUST_FORWARDED_HEADERS=True,
+        ),
+        config=BridgeConfig(),
+        mediamanager_factory=lambda _settings: SelectiveDetailMediaManager(),
+    )
+
+    with TestClient(app) as client:
+        item = seed_submitted_movie_item(client, "movie-ok")
+        url = f"/dashboard/queue/{item['id']}/reconcile"
+        proxy_origin = client.post(
+            url,
+            headers={
+                "X-Api-Key": "test",
+                "Origin": "https://media.example.com",
+                "X-Forwarded-Host": "media.example.com",
+                "X-Forwarded-Proto": "https",
+            },
+            follow_redirects=False,
+        )
+        mismatched_origin = client.post(
+            url,
+            headers={
+                "X-Api-Key": "test",
+                "Origin": "https://evil.example.com",
+                "X-Forwarded-Host": "media.example.com",
+                "X-Forwarded-Proto": "https",
+            },
+            follow_redirects=False,
+        )
+
+    assert proxy_origin.status_code == 303
+    assert mismatched_origin.status_code == 403
+
+
+def test_dashboard_cookie_secure_follows_forwarded_proto_only_when_trusted(
+    tmp_path: Path,
+) -> None:
+    default_app = create_app(
+        settings=settings_for(tmp_path / "plain.db", ENABLE_DASHBOARD=True),
+        config=BridgeConfig(),
+    )
+    with TestClient(default_app) as client:
+        login = client.post(
+            "/dashboard/login",
+            json={"api_key": "test"},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        assert login.status_code == 200
+        assert "secure" not in cookie_flags(login.headers["set-cookie"])
+
+    trusted_app = create_app(
+        settings=settings_for(
+            tmp_path / "trusted.db",
+            ENABLE_DASHBOARD=True,
+            TRUST_FORWARDED_HEADERS=True,
+        ),
+        config=BridgeConfig(),
+    )
+    with TestClient(trusted_app) as client:
+        login = client.post(
+            "/dashboard/login",
+            json={"api_key": "test"},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        assert login.status_code == 200
+        assert "secure" in cookie_flags(login.headers["set-cookie"])
+
+
+EXPECTED_DASHBOARD_CSP = (
+    "default-src 'none'; style-src 'unsafe-inline'; "
+    "form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+)
+
+
+def assert_dashboard_security_headers(response: httpx.Response) -> None:
+    assert response.headers["content-security-policy"] == EXPECTED_DASHBOARD_CSP
+    assert response.headers["x-frame-options"] == "DENY"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_dashboard_and_login_responses_include_security_headers(tmp_path: Path) -> None:
+    app = create_app(
+        settings=settings_for(tmp_path / "screenarr.db", ENABLE_DASHBOARD=True),
+        config=BridgeConfig(),
+    )
+
+    with TestClient(app) as client:
+        login_page = client.get("/dashboard/login")
+        dashboard_page = client.get("/dashboard", headers={"X-Api-Key": "test"})
+        unauthenticated = client.get("/dashboard")
+        api_response = client.get("/api/v3/system/status", headers={"X-Api-Key": "test"})
+
+    assert login_page.status_code == 200
+    assert dashboard_page.status_code == 200
+    assert unauthenticated.status_code == 401
+    for page in (login_page, dashboard_page, unauthenticated):
+        assert_dashboard_security_headers(page)
+    assert "content-security-policy" not in api_response.headers
+    assert "x-frame-options" not in api_response.headers
+
+
+def test_dashboard_login_throttles_repeated_failures(tmp_path: Path) -> None:
+    app = create_app(
+        settings=settings_for(tmp_path / "screenarr.db", ENABLE_DASHBOARD=True),
+        config=BridgeConfig(),
+    )
+    now = [1000.0]
+
+    with TestClient(app) as client:
+        client.app.state.login_throttle = LoginThrottle(
+            max_attempts=3,
+            lockout_seconds=60.0,
+            clock=lambda: now[0],
+        )
+        failures = [
+            client.post("/dashboard/login", json={"api_key": "wrong"}) for _ in range(3)
+        ]
+        locked = client.post("/dashboard/login", json={"api_key": "wrong"})
+        correct_while_locked = client.post("/dashboard/login", json={"api_key": "test"})
+        api_not_throttled = client.get(
+            "/api/v3/system/status",
+            headers={"X-Api-Key": "test"},
+        )
+        now[0] += 61
+        after_expiry = client.post("/dashboard/login", json={"api_key": "test"})
+
+    assert [response.status_code for response in failures] == [401, 401, 401]
+    assert locked.status_code == 429
+    assert int(locked.headers["retry-after"]) > 0
+    assert correct_while_locked.status_code == 429
+    assert api_not_throttled.status_code == 200
+    assert after_expiry.status_code == 200
+
+
+def test_dashboard_login_success_resets_throttle(tmp_path: Path) -> None:
+    app = create_app(
+        settings=settings_for(tmp_path / "screenarr.db", ENABLE_DASHBOARD=True),
+        config=BridgeConfig(),
+    )
+
+    with TestClient(app) as client:
+        client.app.state.login_throttle = LoginThrottle(
+            max_attempts=3,
+            lockout_seconds=60.0,
+            clock=lambda: 1000.0,
+        )
+        attempts = [
+            client.post("/dashboard/login", json={"api_key": "wrong"}),
+            client.post("/dashboard/login", json={"api_key": "wrong"}),
+            client.post("/dashboard/login", json={"api_key": "test"}),
+            client.post("/dashboard/login", json={"api_key": "wrong"}),
+            client.post("/dashboard/login", json={"api_key": "wrong"}),
+        ]
+
+    assert [response.status_code for response in attempts] == [401, 401, 200, 401, 401]
+
+
+def test_login_throttle_validates_configuration() -> None:
+    with pytest.raises(ValueError, match="max_attempts"):
+        LoginThrottle(max_attempts=0)
+    with pytest.raises(ValueError, match="lockout_seconds"):
+        LoginThrottle(lockout_seconds=0)
+    with pytest.raises(ValueError, match="failure_window_seconds"):
+        LoginThrottle(failure_window_seconds=0)
+
+
+def test_login_throttle_prunes_stale_failures() -> None:
+    now = [1000.0]
+    throttle = LoginThrottle(
+        max_attempts=3,
+        lockout_seconds=60.0,
+        failure_window_seconds=300.0,
+        clock=lambda: now[0],
+    )
+    # Two sub-threshold failures, then the client goes quiet beyond the window.
+    throttle.record_failure("10.0.0.1")
+    throttle.record_failure("10.0.0.1")
+    assert "10.0.0.1" in throttle._failures
+    now[0] += 301
+    throttle.retry_after_seconds("10.0.0.2")
+    assert "10.0.0.1" not in throttle._failures
+    # The slate was wiped: two more failures do not reach the lockout threshold.
+    throttle.record_failure("10.0.0.1")
+    throttle.record_failure("10.0.0.1")
+    assert throttle.retry_after_seconds("10.0.0.1") == 0
+    # Expired lockouts are pruned from the lockout map as well.
+    throttle.record_failure("10.0.0.1")
+    assert throttle.retry_after_seconds("10.0.0.1") > 0
+    now[0] += 61
+    throttle._prune_stale()
+    assert "10.0.0.1" not in throttle._locked_until
+
+
+def test_mediamanager_reports_grab_activity_variants() -> None:
+    movie_item: dict[str, Any] = {"media_type": "movie"}
+    assert mediamanager_reports_grab_activity({"downloading": True}, movie_item)
+    assert mediamanager_reports_grab_activity({"grabbed": 1}, movie_item)
+    assert mediamanager_reports_grab_activity({"status": "snatched"}, movie_item)
+    assert mediamanager_reports_grab_activity({"state": "Queued"}, movie_item)
+    assert not mediamanager_reports_grab_activity({"status": "pending"}, movie_item)
+    assert not mediamanager_reports_grab_activity({"downloaded": False}, movie_item)
+    assert not mediamanager_reports_grab_activity({}, movie_item)
+    assert not mediamanager_reports_grab_activity(["not", "a", "mapping"], movie_item)
+
+    show_item: dict[str, Any] = {"media_type": "show", "seasons": [1, 2]}
+    assert mediamanager_reports_grab_activity(
+        {"seasons": [{"season_number": 2, "downloaded": True}]},
+        show_item,
+    )
+    assert mediamanager_reports_grab_activity(
+        {"seasons": [{"season_number": 1, "status": "downloading"}]},
+        show_item,
+    )
+    assert not mediamanager_reports_grab_activity(
+        {"seasons": [{"season_number": 3, "downloaded": True}]},
+        show_item,
+    )
+    # Show-level signals on the payload itself count even when season rows exist.
+    assert mediamanager_reports_grab_activity(
+        {"downloading": True, "seasons": [{"season_number": 3, "downloaded": False}]},
+        show_item,
+    )
+    assert mediamanager_reports_grab_activity(
+        {"status": "grabbed", "seasons": [{"season_number": 1}]},
+        show_item,
+    )
+    # No seasons list falls back to top-level activity, mirroring the import check.
+    assert mediamanager_reports_grab_activity({"grabbed": True}, show_item)
+    assert mediamanager_reports_grab_activity(
+        {"downloading": True},
+        {"media_type": "show", "seasons": []},
+    )
+
+
+def test_reconcile_returns_never_grabbed_submission_to_release_selection(
+    tmp_path: Path,
+) -> None:
+    profile = BridgeProfile(id=101, name="Manual", mode=ReleaseMode.MANUAL)
+    client, fake = make_flow_client(
+        tmp_path / "screenarr.db",
+        profile,
+        RECONCILE_GRACE_SECONDS=0,
+    )
+
+    with client:
+        _response, item = post_media_and_first_queue_item(client)
+        candidate_id = item["candidates"][0]["id"]
+        submitted = client.post(
+            f"/api/bridge/v1/queue/{item['id']}/download/{candidate_id}",
+            headers={"X-Api-Key": "test"},
+        ).json()
+        # Crash window: the bridge marked the item submitted but the grab never
+        # reached MediaManager, which shows neither import nor download activity.
+        fake.movie_detail = {"id": "movie-uuid", "downloaded": False}
+        reconciled = client.post(
+            f"/api/bridge/v1/queue/{item['id']}/reconcile",
+            headers={"X-Api-Key": "test"},
+        ).json()
+        stored = client.app.state.store.get_queue_item(item["id"])
+        events = client.app.state.store.list_events(item["id"])
+        retry = client.post(
+            f"/api/bridge/v1/queue/{item['id']}/download/{candidate_id}",
+            headers={"X-Api-Key": "test"},
+        )
+        retried = client.app.state.store.get_queue_item(item["id"])
+
+    assert submitted["status"] == "download_submitted"
+    assert reconciled["status"] == "needs_release"
+    assert stored["status"] == "needs_release"
+    assert [candidate["result_id"] for candidate in stored["candidates"]] == ["release-one"]
+    assert events[0]["event_type"] == "queue.download_not_grabbed"
+    assert retry.status_code == 200
+    assert retried["status"] == "download_submitted"
+    assert fake.downloaded_movies == ["release-one", "release-one"]
+
+
+def test_reconcile_keeps_submitted_item_with_active_grab(tmp_path: Path) -> None:
+    profile = BridgeProfile(id=101, name="Manual", mode=ReleaseMode.MANUAL)
+    client, fake = make_flow_client(tmp_path / "screenarr.db", profile)
+
+    with client:
+        _response, item = post_media_and_first_queue_item(client)
+        candidate_id = item["candidates"][0]["id"]
+        client.post(
+            f"/api/bridge/v1/queue/{item['id']}/download/{candidate_id}",
+            headers={"X-Api-Key": "test"},
+        )
+        # The fake marks the detail with active download activity on a grab.
+        reconciled = client.post(
+            f"/api/bridge/v1/queue/{item['id']}/reconcile",
+            headers={"X-Api-Key": "test"},
+        ).json()
+        # Status-string based activity also counts as an in-progress grab.
+        fake.movie_detail = {"id": "movie-uuid", "status": "queued"}
+        reconciled_again = client.post(
+            f"/api/bridge/v1/queue/{item['id']}/reconcile",
+            headers={"X-Api-Key": "test"},
+        ).json()
+        events = client.app.state.store.list_events(item["id"])
+
+    assert reconciled["status"] == "download_submitted"
+    assert reconciled_again["status"] == "download_submitted"
+    assert all(
+        event["event_type"] != "queue.download_not_grabbed" for event in events
+    )
+
+
+def test_reconcile_imported_item_still_transitions_then_webhook_marks_available(
+    tmp_path: Path,
+) -> None:
+    profile = BridgeProfile(id=101, name="Manual", mode=ReleaseMode.MANUAL)
+    fake = FakeMediaManager()
+    app = create_app(
+        settings=settings_for(
+            tmp_path / "screenarr.db",
+            ENABLE_DASHBOARD=True,
+            ENABLE_ONSCREEN_WEBHOOK=True,
+            **webhook_secret_setting(),
+        ),
+        config=BridgeConfig(profiles=[profile]),
+        mediamanager_factory=lambda _settings: fake,
+    )
+
+    with TestClient(app) as client:
+        _response, item = post_media_and_first_queue_item(client)
+        candidate_id = item["candidates"][0]["id"]
+        client.post(
+            f"/api/bridge/v1/queue/{item['id']}/download/{candidate_id}",
+            headers={"X-Api-Key": "test"},
+        )
+        fake.movie_detail = {"id": "movie-uuid", "downloaded": True}
+        reconciled = client.post(
+            f"/api/bridge/v1/queue/{item['id']}/reconcile",
+            headers={"X-Api-Key": "test"},
+        ).json()
+        body = (
+            b'{"event":"library.scan.complete","status":"available",'
+            b'"media_type":"movie","tmdb_id":550}'
+        )
+        timestamp = str(int(time.time()))
+        webhook = client.post(
+            "/integrations/onscreen/webhook",
+            content=body,
+            headers={
+                "X-OnScreen-Timestamp": timestamp,
+                "X-OnScreen-Signature": sign_webhook(TEST_WEBHOOK_SECRET, timestamp, body),
+                "Content-Type": "application/json",
+            },
+        )
+        stored = client.app.state.store.get_queue_item(item["id"])
+
+    assert reconciled["status"] == "imported"
+    assert webhook.status_code == 200
+    assert stored["status"] == "available"
+
+
+def test_show_reconcile_bounces_only_without_any_season_activity(tmp_path: Path) -> None:
+    profile = BridgeProfile(id=101, name="Manual", mode=ReleaseMode.MANUAL)
+    client, fake = make_flow_client(
+        tmp_path / "screenarr.db",
+        profile,
+        RECONCILE_GRACE_SECONDS=0,
+    )
+
+    with client:
+        _response, item = post_media_and_first_queue_item(
+            client,
+            endpoint="/api/v3/series",
+            payload=show_payload(),
+        )
+        candidate_id = item["candidates"][0]["id"]
+        submitted = client.post(
+            f"/api/bridge/v1/queue/{item['id']}/download/{candidate_id}",
+            headers={"X-Api-Key": "test"},
+        ).json()
+        # Season 1 grab in progress: the item must stay submitted.
+        fake.show_detail = {
+            "id": "show-uuid",
+            "seasons": [{"season_number": 1, "status": "downloading"}],
+        }
+        stays = client.post(
+            f"/api/bridge/v1/queue/{item['id']}/reconcile",
+            headers={"X-Api-Key": "test"},
+        ).json()
+        # No grab activity for any requested season: bounce back for re-pick.
+        fake.show_detail = {
+            "id": "show-uuid",
+            "seasons": [{"season_number": 2, "downloaded": True}],
+        }
+        bounced = client.post(
+            f"/api/bridge/v1/queue/{item['id']}/reconcile",
+            headers={"X-Api-Key": "test"},
+        ).json()
+        events = client.app.state.store.list_events(item["id"])
+
+    assert submitted["status"] == "download_submitted"
+    assert stays["status"] == "download_submitted"
+    assert bounced["status"] == "needs_release"
+    assert events[0]["event_type"] == "queue.download_not_grabbed"
+
+
+def test_recover_stale_claims_leaves_download_submitted_untouched(tmp_path: Path) -> None:
+    store = BridgeStore(tmp_path / "screenarr.db")
+    store.init()
+    item = seed_movie_item(
+        store,
+        status="download_submitted",
+        mediamanager_id="movie-uuid",
+    )
+
+    recovered = store.recover_stale_claims(older_than_seconds=-1)
+
+    assert recovered == 0
+    assert store.get_queue_item(item["id"])["status"] == "download_submitted"
+
+
+def test_settings_include_reconcile_grace_default(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path / "screenarr.db")
+    custom = settings_for(tmp_path / "custom.db", RECONCILE_GRACE_SECONDS=0)
+
+    assert settings.reconcile_grace_seconds == 900
+    assert custom.reconcile_grace_seconds == 0
+
+
+def test_reconcile_holds_fresh_submission_during_grace_period(tmp_path: Path) -> None:
+    profile = BridgeProfile(id=101, name="Manual", mode=ReleaseMode.MANUAL)
+    client, fake = make_flow_client(tmp_path / "screenarr.db", profile)
+
+    with client:
+        _response, item = post_media_and_first_queue_item(client)
+        candidate_id = item["candidates"][0]["id"]
+        submitted = client.post(
+            f"/api/bridge/v1/queue/{item['id']}/download/{candidate_id}",
+            headers={"X-Api-Key": "test"},
+        ).json()
+        # Negative snapshot right after the grab: MediaManager detail lags.
+        fake.movie_detail = {"id": "movie-uuid", "downloaded": False}
+        reconciled = client.post(
+            f"/api/bridge/v1/queue/{item['id']}/reconcile",
+            headers={"X-Api-Key": "test"},
+        ).json()
+        events = client.app.state.store.list_events(item["id"])
+
+    assert submitted["status"] == "download_submitted"
+    assert reconciled["status"] == "download_submitted"
+    # The grace hold records nothing: no bounce and no noop churn.
+    assert [event["event_type"] for event in events] == [
+        "queue.download_submitted",
+        "queue.created",
+    ]
+
+
+def test_reconcile_bounces_never_grabbed_submission_after_grace_elapses(
+    tmp_path: Path,
+) -> None:
+    profile = BridgeProfile(id=101, name="Manual", mode=ReleaseMode.MANUAL)
+    db_path = tmp_path / "screenarr.db"
+    client, fake = make_flow_client(db_path, profile)
+
+    with client:
+        _response, item = post_media_and_first_queue_item(client)
+        candidate_id = item["candidates"][0]["id"]
+        client.post(
+            f"/api/bridge/v1/queue/{item['id']}/download/{candidate_id}",
+            headers={"X-Api-Key": "test"},
+        )
+        fake.movie_detail = {"id": "movie-uuid", "downloaded": False}
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(
+                "UPDATE queue_items SET updated_at = ? WHERE id = ?",
+                ("2020-01-01T00:00:00+00:00", item["id"]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        reconciled = client.post(
+            f"/api/bridge/v1/queue/{item['id']}/reconcile",
+            headers={"X-Api-Key": "test"},
+        ).json()
+        events = client.app.state.store.list_events(item["id"])
+
+    assert reconciled["status"] == "needs_release"
+    assert events[0]["event_type"] == "queue.download_not_grabbed"
+
+
+def test_reconcile_never_bounces_download_unverified(tmp_path: Path) -> None:
+    profile = BridgeProfile(id=101, name="Manual", mode=ReleaseMode.MANUAL)
+    client, fake = make_flow_client(
+        tmp_path / "screenarr.db",
+        profile,
+        RECONCILE_GRACE_SECONDS=0,
+    )
+
+    with client:
+        _response, item = post_media_and_first_queue_item(client)
+        candidate_id = item["candidates"][0]["id"]
+        fake.fail_next_download_timeout = True
+        timed_out = client.post(
+            f"/api/bridge/v1/queue/{item['id']}/download/{candidate_id}",
+            headers={"X-Api-Key": "test"},
+        ).json()
+        # Unverified stays ambiguous even with a negative snapshot past grace.
+        fake.movie_detail = {"id": "movie-uuid", "downloaded": False}
+        reconciled = client.post(
+            f"/api/bridge/v1/queue/{item['id']}/reconcile",
+            headers={"X-Api-Key": "test"},
+        ).json()
+        events = client.app.state.store.list_events(item["id"])
+
+    assert timed_out["status"] == "download_unverified"
+    assert reconciled["status"] == "download_unverified"
+    assert all(
+        event["event_type"] != "queue.download_not_grabbed" for event in events
+    )
+
+
+def test_show_reconcile_holds_fresh_submission_during_grace_period(
+    tmp_path: Path,
+) -> None:
+    profile = BridgeProfile(id=101, name="Manual", mode=ReleaseMode.MANUAL)
+    client, fake = make_flow_client(tmp_path / "screenarr.db", profile)
+
+    with client:
+        _response, item = post_media_and_first_queue_item(
+            client,
+            endpoint="/api/v3/series",
+            payload=show_payload(),
+        )
+        candidate_id = item["candidates"][0]["id"]
+        submitted = client.post(
+            f"/api/bridge/v1/queue/{item['id']}/download/{candidate_id}",
+            headers={"X-Api-Key": "test"},
+        ).json()
+        # No activity for any requested season, but still inside the grace window.
+        fake.show_detail = {
+            "id": "show-uuid",
+            "seasons": [{"season_number": 2, "downloaded": True}],
+        }
+        reconciled = client.post(
+            f"/api/bridge/v1/queue/{item['id']}/reconcile",
+            headers={"X-Api-Key": "test"},
+        ).json()
+        events = client.app.state.store.list_events(item["id"])
+
+    assert submitted["status"] == "download_submitted"
+    assert reconciled["status"] == "download_submitted"
+    assert all(
+        event["event_type"] != "queue.download_not_grabbed" for event in events
+    )
+
+
+def test_login_throttle_is_scoped_per_client_ip() -> None:
+    now = [1000.0]
+    throttle = LoginThrottle(max_attempts=2, lockout_seconds=60.0, clock=lambda: now[0])
+
+    throttle.record_failure("10.0.0.1")
+    throttle.record_failure("10.0.0.1")
+
+    assert throttle.retry_after_seconds("10.0.0.1") > 0
+    # A second client is unaffected by the first client's lockout.
+    assert throttle.retry_after_seconds("10.0.0.2") == 0
+    throttle.record_failure("10.0.0.2")
+    assert throttle.retry_after_seconds("10.0.0.2") == 0
+    throttle.record_success("10.0.0.2")
+    assert throttle.retry_after_seconds("10.0.0.2") == 0
+    assert throttle.retry_after_seconds("10.0.0.1") > 0
+    now[0] += 61
+    assert throttle.retry_after_seconds("10.0.0.1") == 0
+
+
+def test_validate_static_config_warns_when_forwarded_headers_trusted(
+    tmp_path: Path,
+) -> None:
+    trusted_issues = validate_static_config(
+        BridgeConfig(),
+        settings_for(tmp_path / "trusted.db", TRUST_FORWARDED_HEADERS=True),
+    )
+    default_issues = validate_static_config(
+        BridgeConfig(),
+        settings_for(tmp_path / "default.db"),
+    )
+
+    trusted_codes = {item["code"] for item in trusted_issues}
+    default_codes = {item["code"] for item in default_issues}
+    assert "settings.trust_forwarded_headers" in trusted_codes
+    assert "settings.trust_forwarded_headers" not in default_codes
+
+
+def test_manual_add_transport_failure_rolls_back_claim_and_stays_retryable(
+    tmp_path: Path,
+) -> None:
+    profile = BridgeProfile(id=101, name="Manual", mode=ReleaseMode.MANUAL)
+    client, fake = make_flow_client(tmp_path / "screenarr.db", profile)
+
+    with client:
+        async def fail_add(_tmdb_id: int, language: str | None = None) -> dict[str, Any]:
+            raise httpx.ConnectError("add connect failed")
+
+        fake.add_movie = fail_add
+        failed = client.post(
+            "/api/v3/movie",
+            json=movie_payload(),
+            headers={"X-Api-Key": "test"},
+        )
+        item = client.get("/api/bridge/v1/queue", headers={"X-Api-Key": "test"}).json()[
+            "items"
+        ][0]
+        # Transport failure rolled the claim back; a retry adds cleanly.
+        del fake.add_movie
+        retry = client.post(
+            "/api/v3/movie",
+            json=movie_payload(),
+            headers={"X-Api-Key": "test"},
+        )
+        retried = client.get(
+            "/api/bridge/v1/queue",
+            headers={"X-Api-Key": "test"},
+        ).json()["items"][0]
+
+    assert failed.status_code == 502
+    assert failed.json()["detail"] == "MediaManager request failed"
+    assert item["status"] == "needs_release"
+    assert item["mediamanager_id"] is None
+    assert item["last_error"]["event_type"] == "queue.add_failed"
+    assert retry.status_code == 200
+    assert retried["status"] == "needs_release"
+    assert retried["mediamanager_id"] == "movie-uuid"
+    assert retried["candidates"][0]["result_id"] == "release-one"
+    assert fake.added_movies == [550]
+
+
+def test_manual_add_transport_failure_after_landed_add_reuses_existing(
+    tmp_path: Path,
+) -> None:
+    profile = BridgeProfile(id=101, name="Manual", mode=ReleaseMode.MANUAL)
+    client, fake = make_flow_client(tmp_path / "screenarr.db", profile)
+
+    with client:
+        original_add = fake.add_movie
+        landed = False
+
+        async def flaky_add(tmdb_id: int, language: str | None = None) -> dict[str, Any]:
+            nonlocal landed
+            if not landed:
+                landed = True
+                await original_add(tmdb_id)
+                raise httpx.ConnectError("response lost")
+            # The real client gets a 409 here and looks up the existing entry
+            # instead of adding a duplicate.
+            return {"id": "movie-uuid", "external_id": tmdb_id, "library": "Default"}
+
+        fake.add_movie = flaky_add
+        first = client.post(
+            "/api/v3/movie",
+            json=movie_payload(),
+            headers={"X-Api-Key": "test"},
+        )
+        second = client.post(
+            "/api/v3/movie",
+            json=movie_payload(),
+            headers={"X-Api-Key": "test"},
+        )
+        item = client.get("/api/bridge/v1/queue", headers={"X-Api-Key": "test"}).json()[
+            "items"
+        ][0]
+
+    assert first.status_code == 502
+    assert second.status_code == 200
+    assert item["status"] == "needs_release"
+    assert item["mediamanager_id"] == "movie-uuid"
+    assert fake.added_movies == [550]
+
+
+def test_approval_add_transport_failure_rolls_back_to_pending_approval(
+    tmp_path: Path,
+) -> None:
+    profile = BridgeProfile(id=101, name="Approval", mode=ReleaseMode.APPROVAL)
+    client, fake = make_flow_client(tmp_path / "screenarr.db", profile)
+
+    with client:
+        _response, item = post_media_and_first_queue_item(client)
+
+        async def fail_add(_tmdb_id: int, language: str | None = None) -> dict[str, Any]:
+            raise httpx.ConnectError("add connect failed")
+
+        fake.add_movie = fail_add
+        failed = client.post(
+            f"/api/bridge/v1/queue/{item['id']}/approve",
+            headers={"X-Api-Key": "test"},
+        )
+        stored = client.app.state.store.get_queue_item(item["id"])
+
+    assert failed.status_code == 502
+    assert failed.json()["detail"] == "MediaManager request failed"
+    assert stored["status"] == "pending_approval"
+    assert stored["last_error"]["event_type"] == "queue.approval_failed"
+
+
+def test_manual_add_race_keeps_winning_mediamanager_association(tmp_path: Path) -> None:
+    profile = BridgeProfile(id=101, name="Manual", mode=ReleaseMode.MANUAL)
+    client, fake = make_flow_client(tmp_path / "screenarr.db", profile)
+
+    with client:
+        store = client.app.state.store
+        original_update = store.update_queue_item
+        raced = False
+
+        def racing_update(queue_id: str, **kwargs: Any) -> dict[str, Any] | None:
+            nonlocal raced
+            if (
+                not raced
+                and kwargs.get("from_status") == "download_claimed"
+                and kwargs.get("mediamanager_id")
+            ):
+                raced = True
+                # A competing worker completes the claim first.
+                original_update(
+                    queue_id,
+                    status="needs_release",
+                    mediamanager_id="winner-uuid",
+                    from_status="download_claimed",
+                )
+            return original_update(queue_id, **kwargs)
+
+        store.update_queue_item = racing_update
+        response = client.post(
+            "/api/v3/movie",
+            json=movie_payload(),
+            headers={"X-Api-Key": "test"},
+        )
+        stored = client.get("/api/bridge/v1/queue", headers={"X-Api-Key": "test"}).json()[
+            "items"
+        ][0]
+
+    assert raced
+    assert response.status_code == 200
+    assert stored["status"] == "needs_release"
+    assert stored["mediamanager_id"] == "winner-uuid"

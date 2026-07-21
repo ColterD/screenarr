@@ -7,9 +7,10 @@ import logging
 import re
 import secrets
 import time
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from functools import partial
 from typing import Annotated, Any
 from urllib.parse import parse_qs, urlsplit
@@ -51,7 +52,7 @@ from bridge.config import (
     Settings,
     load_bridge_config,
 )
-from bridge.dashboard import dashboard_html, events_html
+from bridge.dashboard import dashboard_html, dashboard_login_html, events_html
 from bridge.mediamanager import (
     MediaManagerClient,
     MediaManagerError,
@@ -59,6 +60,7 @@ from bridge.mediamanager import (
     choose_best_release,
 )
 from bridge.security import (
+    LoginThrottle,
     sign_dashboard_session,
     verify_dashboard_session,
     verify_onscreen_signature,
@@ -69,6 +71,17 @@ from bridge.validation import issue, validate_static_config
 log = logging.getLogger(__name__)
 MAX_WEBHOOK_BODY_BYTES = 64 * 1024
 MAX_DASHBOARD_LOGIN_BODY_BYTES = 8 * 1024
+# Dashboard pages render server-side HTML with an inline <style> block and no
+# JavaScript, so the CSP allows inline styles only.
+DASHBOARD_SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'none'; style-src 'unsafe-inline'; "
+        "form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+    ),
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+}
 MEDIAMANAGER_DETAIL_FAILURE = "MediaManager detail request failed"
 MEDIAMANAGER_REQUEST_FAILURE = "MediaManager request failed"
 MEDIAMANAGER_CANDIDATE_REFRESH_FAILURE = "MediaManager candidate refresh failed"
@@ -159,6 +172,7 @@ def create_app(
                     store,
                     media_manager,
                     interval_seconds=settings.mediamanager_reconcile_interval_seconds,
+                    grace_seconds=settings.reconcile_grace_seconds,
                 )
             )
         try:
@@ -185,12 +199,15 @@ def create_app(
     app.state.store = store
     app.state.mm = media_manager
     app.state.dashboard_session_secret = dashboard_session_secret
+    app.state.login_throttle = LoginThrottle()
 
     @app.middleware("http")
-    async def dashboard_no_store(request: Request, call_next: Any) -> Response:
+    async def dashboard_security_headers(request: Request, call_next: Any) -> Response:
         response = await call_next(request)
         if is_dashboard_path(request.url.path):
             response.headers["Cache-Control"] = "no-store"
+            for header, value in DASHBOARD_SECURITY_HEADERS.items():
+                response.headers.setdefault(header, value)
         return response
 
     async def require_api_key(
@@ -328,10 +345,21 @@ def create_app(
         settings: Settings = request.app.state.settings
         if not settings.enable_dashboard:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "dashboard disabled")
+        throttle: LoginThrottle = request.app.state.login_throttle
+        client_ip = request.client.host if request.client else "unknown"
+        retry_after = throttle.retry_after_seconds(client_ip)
+        if retry_after:
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                "too many failed login attempts; try again later",
+                headers={"Retry-After": str(retry_after)},
+            )
         expected = settings.bridge_api_key.get_secret_value()
         supplied, browser_form = await parse_dashboard_login(request)
         if not expected or not constant_time_equal(supplied, expected):
+            throttle.record_failure(client_ip)
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid API key")
+        throttle.record_success(client_ip)
         target_response: Response
         if browser_form:
             target_response = RedirectResponse("/dashboard", status_code=status.HTTP_303_SEE_OTHER)
@@ -507,7 +535,7 @@ def create_app(
                         status.HTTP_409_CONFLICT,
                         "queue item approval claim expired; retry approval",
                     )
-        except MediaManagerError as exc:
+        except (MediaManagerError, httpx.TransportError) as exc:
             await store_call(
                 store.update_queue_item,
                 queue_id,
@@ -517,7 +545,7 @@ def create_app(
             await store_call(
                 store.add_event,
                 event_type="queue.approval_failed",
-                message=str(exc),
+                message=str(exc) or exc.__class__.__name__,
                 queue_id=queue_id,
             )
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, MEDIAMANAGER_REQUEST_FAILURE) from exc
@@ -604,90 +632,18 @@ def create_app(
         mm: MediaManagerClient = request.app.state.mm
         store: BridgeStore = request.app.state.store
 
-        if profile.mode == ReleaseMode.APPROVAL:
-            item = await store_call(
-                store.upsert_queue_item,
+        if profile.mode in (ReleaseMode.APPROVAL, ReleaseMode.MANUAL):
+            await enqueue_approval_or_manual_request(
+                store,
+                mm,
+                profile,
                 media_type="movie",
                 external_id=body.tmdbId,
                 title=body.title,
-                profile_id=profile.id,
-                profile_name=profile.name,
-                mode=profile.mode,
-                status="pending_approval",
+                seasons=None,
+                search_requested=body.addOptions.searchForMovie,
                 payload=body.model_dump(mode="json"),
-            )
-            ensure_queue_status(item, APPROVAL_ACCEPTED_STATUSES)
-            if item["status"] == "pending_approval":
-                await store_call(
-                    store.add_event,
-                    event_type="queue.created",
-                    message="movie request is pending bridge approval",
-                    queue_id=item["id"],
-                )
-            return AddMovieResponse(id=stable_int_id(body.tmdbId), title=body.title)
-
-        if profile.mode == ReleaseMode.MANUAL:
-            item = await store_call(
-                store.upsert_queue_item,
-                media_type="movie",
-                external_id=body.tmdbId,
-                title=body.title,
-                profile_id=profile.id,
-                profile_name=profile.name,
-                mode=profile.mode,
-                status="needs_release",
-                payload=body.model_dump(mode="json"),
-            )
-            ensure_queue_status(item, MANUAL_ACCEPTED_STATUSES)
-            if item["status"] != "needs_release" or item.get("mediamanager_id"):
-                return AddMovieResponse(id=stable_int_id(body.tmdbId), title=body.title)
-            claimed = await store_call(
-                store.transition_queue_item,
-                item["id"],
-                from_status="needs_release",
-                to_status="download_claimed",
-            )
-            if claimed is None:
-                return AddMovieResponse(id=stable_int_id(body.tmdbId), title=body.title)
-            try:
-                movie_uuid = await add_movie_to_mediamanager(mm, profile, body.tmdbId)
-            except MediaManagerError as exc:
-                await store_call(
-                    store.update_queue_item,
-                    item["id"],
-                    status="needs_release",
-                    from_status="download_claimed",
-                )
-                raise HTTPException(
-                    status.HTTP_502_BAD_GATEWAY,
-                    MEDIAMANAGER_REQUEST_FAILURE,
-                ) from exc
-            updated = await store_call(
-                store.update_queue_item,
-                item["id"],
-                status="needs_release",
-                mediamanager_id=movie_uuid,
-                from_status="download_claimed",
-            )
-            if updated is None:
-                await store_call(store.update_queue_item, item["id"], mediamanager_id=movie_uuid)
-                return AddMovieResponse(id=stable_int_id(body.tmdbId), title=body.title)
-            item = updated
-            if body.addOptions.searchForMovie:
-                try:
-                    await refresh_candidates_for_item(store, mm, item, profile)
-                except MediaManagerError as exc:
-                    await store_call(
-                        store.add_event,
-                        event_type="queue.candidate_refresh_failed",
-                        message=str(exc),
-                        queue_id=item["id"],
-                    )
-            await store_call(
-                store.add_event,
-                event_type="queue.created",
-                message="movie request is waiting for manual release selection",
-                queue_id=item["id"],
+                add_to_mediamanager=add_movie_to_mediamanager,
             )
             return AddMovieResponse(id=stable_int_id(body.tmdbId), title=body.title)
 
@@ -769,92 +725,18 @@ def create_app(
         tmdb_id = body.tvdbId
         seasons = monitored_seasons(body.seasons)
 
-        if profile.mode == ReleaseMode.APPROVAL:
-            item = await store_call(
-                store.upsert_queue_item,
+        if profile.mode in (ReleaseMode.APPROVAL, ReleaseMode.MANUAL):
+            await enqueue_approval_or_manual_request(
+                store,
+                mm,
+                profile,
                 media_type="show",
                 external_id=tmdb_id,
                 title=body.title,
-                profile_id=profile.id,
-                profile_name=profile.name,
-                mode=profile.mode,
-                status="pending_approval",
                 seasons=seasons,
+                search_requested=body.addOptions.searchForMissingEpisodes,
                 payload=body.model_dump(mode="json"),
-            )
-            ensure_queue_status(item, APPROVAL_ACCEPTED_STATUSES)
-            if item["status"] == "pending_approval":
-                await store_call(
-                    store.add_event,
-                    event_type="queue.created",
-                    message="show request is pending bridge approval",
-                    queue_id=item["id"],
-                )
-            return AddSeriesResponse(id=stable_int_id(tmdb_id), title=body.title)
-
-        if profile.mode == ReleaseMode.MANUAL:
-            item = await store_call(
-                store.upsert_queue_item,
-                media_type="show",
-                external_id=tmdb_id,
-                title=body.title,
-                profile_id=profile.id,
-                profile_name=profile.name,
-                mode=profile.mode,
-                status="needs_release",
-                seasons=seasons,
-                payload=body.model_dump(mode="json"),
-            )
-            ensure_queue_status(item, MANUAL_ACCEPTED_STATUSES)
-            if item["status"] != "needs_release" or item.get("mediamanager_id"):
-                return AddSeriesResponse(id=stable_int_id(tmdb_id), title=body.title)
-            claimed = await store_call(
-                store.transition_queue_item,
-                item["id"],
-                from_status="needs_release",
-                to_status="download_claimed",
-            )
-            if claimed is None:
-                return AddSeriesResponse(id=stable_int_id(tmdb_id), title=body.title)
-            try:
-                show_uuid = await add_show_to_mediamanager(mm, profile, tmdb_id)
-            except MediaManagerError as exc:
-                await store_call(
-                    store.update_queue_item,
-                    item["id"],
-                    status="needs_release",
-                    from_status="download_claimed",
-                )
-                raise HTTPException(
-                    status.HTTP_502_BAD_GATEWAY,
-                    MEDIAMANAGER_REQUEST_FAILURE,
-                ) from exc
-            updated = await store_call(
-                store.update_queue_item,
-                item["id"],
-                status="needs_release",
-                mediamanager_id=show_uuid,
-                from_status="download_claimed",
-            )
-            if updated is None:
-                await store_call(store.update_queue_item, item["id"], mediamanager_id=show_uuid)
-                return AddSeriesResponse(id=stable_int_id(tmdb_id), title=body.title)
-            item = updated
-            if body.addOptions.searchForMissingEpisodes:
-                try:
-                    await refresh_candidates_for_item(store, mm, item, profile)
-                except MediaManagerError as exc:
-                    await store_call(
-                        store.add_event,
-                        event_type="queue.candidate_refresh_failed",
-                        message=str(exc),
-                        queue_id=item["id"],
-                    )
-            await store_call(
-                store.add_event,
-                event_type="queue.created",
-                message="show request is waiting for manual release selection",
-                queue_id=item["id"],
+                add_to_mediamanager=add_show_to_mediamanager,
             )
             return AddSeriesResponse(id=stable_int_id(tmdb_id), title=body.title)
 
@@ -1016,15 +898,12 @@ async def reconcile_bulk_queue_item(
 
 
 def same_origin_dashboard_post(request: Request) -> bool:
-    host = (
-        first_forwarded_value(request.headers.get("x-forwarded-host"))
-        or request.headers.get("host")
-        or request.url.netloc
-    )
-    scheme = (
-        first_forwarded_value(request.headers.get("x-forwarded-proto"))
-        or request.url.scheme
-    )
+    settings: Settings = request.app.state.settings
+    host = request.headers.get("host") or request.url.netloc
+    scheme = request.url.scheme
+    if settings.trust_forwarded_headers:
+        host = first_forwarded_value(request.headers.get("x-forwarded-host")) or host
+        scheme = first_forwarded_value(request.headers.get("x-forwarded-proto")) or scheme
     expected_origin = f"{scheme}://{host}"
     origin = request.headers.get("origin")
     if origin:
@@ -1094,6 +973,7 @@ async def mediamanager_reconcile_loop(
     mm: MediaManagerClient,
     *,
     interval_seconds: int,
+    grace_seconds: float = 900.0,
 ) -> None:
     while True:
         await asyncio.sleep(interval_seconds)
@@ -1106,7 +986,13 @@ async def mediamanager_reconcile_loop(
         for item in eligible_items:
             queue_id = str(item["id"])
             try:
-                await reconcile_queue_item(store, mm, item, record_noop=False)
+                await reconcile_queue_item(
+                    store,
+                    mm,
+                    item,
+                    record_noop=False,
+                    grace_seconds=grace_seconds,
+                )
             except httpx.TransportError as exc:
                 log.warning(
                     "MediaManager queue item reconciliation transport failed",
@@ -1357,10 +1243,16 @@ async def terminal_item_or_expired_claim_conflict(
 async def reconcile_queue_item_action(request: Request, queue_id: str) -> dict[str, Any]:
     store: BridgeStore = request.app.state.store
     mm: MediaManagerClient = request.app.state.mm
+    settings: Settings = request.app.state.settings
     item = await get_queue_or_404(store, queue_id)
     try:
         return await asyncio.wait_for(
-            reconcile_queue_item(store, mm, item),
+            reconcile_queue_item(
+                store,
+                mm,
+                item,
+                grace_seconds=settings.reconcile_grace_seconds,
+            ),
             timeout=MAX_BULK_RECONCILE_ITEM_SECONDS,
         )
     except TimeoutError as exc:
@@ -1407,6 +1299,7 @@ async def reconcile_queue_item(
     item: dict[str, Any],
     *,
     record_noop: bool = True,
+    grace_seconds: float = 900.0,
 ) -> dict[str, Any]:
     queue_id = str(item["id"])
     if item["status"] not in RECONCILE_QUEUE_STATUSES:
@@ -1441,6 +1334,39 @@ async def reconcile_queue_item(
             store.add_event,
             event_type="queue.imported",
             message="MediaManager reports item downloaded/imported",
+            queue_id=queue_id,
+            payload=mediamanager_reconcile_summary(details),
+        )
+        return updated
+    if item["status"] == "download_submitted" and not mediamanager_reports_grab_activity(
+        details,
+        item,
+    ):
+        if not download_submitted_past_grace(item, grace_seconds):
+            # MediaManager's detail endpoint can lag the grab. Hold the item in
+            # download_submitted for the grace window so a stale negative
+            # snapshot cannot bounce it into a duplicate grab. No event churn.
+            return await store_call(store.get_queue_item, queue_id)
+        # Crash-window recovery: the bridge marked the item download_submitted,
+        # the grace window elapsed, and MediaManager still shows neither an
+        # import nor any active grab, so the download call never landed.
+        # Return the item to release selection so the user can re-pick a
+        # release instead of stranding it forever.
+        updated = await store_call(
+            store.update_queue_item,
+            queue_id,
+            status="needs_release",
+            from_status="download_submitted",
+        )
+        if updated is None:
+            return await store_call(store.get_queue_item, queue_id)
+        await store_call(
+            store.add_event,
+            event_type="queue.download_not_grabbed",
+            message=(
+                "MediaManager shows no active download for the submitted release; "
+                "returned to release selection"
+            ),
             queue_id=queue_id,
             payload=mediamanager_reconcile_summary(details),
         )
@@ -1693,6 +1619,74 @@ def top_level_reports_imported(details: Mapping[str, Any]) -> bool:
     return status_value in {"available", "downloaded", "imported", "complete", "completed"}
 
 
+def mediamanager_reports_grab_activity(
+    details: object,
+    item: dict[str, Any],
+) -> bool:
+    if not isinstance(details, Mapping):
+        return False
+    # A show-level activity signal on the payload itself always counts, even
+    # when per-season detail rows are present.
+    if top_level_reports_grab_activity(details):
+        return True
+    if item.get("media_type") != "show":
+        return False
+    requested_seasons = {int(season) for season in item.get("seasons") or []}
+    if not requested_seasons:
+        return False
+    season_details = details.get("seasons")
+    if not isinstance(season_details, list):
+        return False
+    for season in season_details:
+        if not isinstance(season, Mapping):
+            continue
+        season_number = season_detail_number(season)
+        if season_number is None or season_number not in requested_seasons:
+            continue
+        # A partially imported or actively grabbing season still proves the
+        # submitted download reached MediaManager.
+        if top_level_reports_imported(season) or top_level_reports_grab_activity(season):
+            return True
+    return False
+
+
+def download_submitted_past_grace(item: Mapping[str, Any], grace_seconds: float) -> bool:
+    """Whether a download_submitted item is old enough to bounce back.
+
+    updated_at tracks the last queue write, which for a submitted item is the
+    submission transition; an unparseable timestamp fails open to recovery.
+    """
+    if grace_seconds <= 0:
+        return True
+    updated_at = item.get("updated_at")
+    if not isinstance(updated_at, str):
+        return True
+    try:
+        submitted_at = datetime.fromisoformat(updated_at)
+    except ValueError:
+        return True
+    return (datetime.now(UTC) - submitted_at).total_seconds() >= grace_seconds
+
+
+def top_level_reports_grab_activity(details: Mapping[str, Any]) -> bool:
+    for key in (
+        "downloading",
+        "grabbed",
+        "in_progress",
+        "is_downloading",
+        "is_grabbed",
+        "isDownloading",
+        "isGrabbed",
+        "active_download",
+        "download_in_progress",
+        "downloadInProgress",
+    ):
+        if truthy(details.get(key)):
+            return True
+    status_value = str(details.get("status") or details.get("state") or "").lower()
+    return status_value in {"downloading", "grabbed", "snatched", "queued"}
+
+
 def season_detail_number(season: Mapping[str, Any]) -> int | None:
     for key in ("season_number", "seasonNumber", "number", "season"):
         value = parse_webhook_int(season.get(key))
@@ -1768,46 +1762,6 @@ async def parse_dashboard_login(request: Request) -> tuple[str, bool]:
     )
     form = parse_qs(raw_body.decode("utf-8", errors="replace"))
     return form.get("api_key", [""])[0], True
-
-
-def dashboard_login_html() -> str:
-    return """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Screenarr Login</title>
-  <style>
-    :root { color-scheme: dark; --bg: #111315; --line: #2b3137; --text: #eef2f5; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      display: grid;
-      place-items: center;
-      background: var(--bg);
-      color: var(--text);
-      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-    form { width: min(360px, calc(100vw - 32px)); display: grid; gap: 12px; }
-    label { font-weight: 700; }
-    input, button {
-      width: 100%;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 10px 12px;
-      font: inherit;
-    }
-    button { cursor: pointer; font-weight: 700; }
-  </style>
-</head>
-<body>
-  <form method="post" action="/dashboard/login">
-    <label for="api_key">Screenarr API key</label>
-    <input id="api_key" name="api_key" type="password" autocomplete="current-password" required>
-    <button type="submit">Open dashboard</button>
-  </form>
-</body>
-</html>"""
 
 
 def webhook_event_summary(payload: dict[str, Any]) -> dict[str, str]:
@@ -1985,14 +1939,145 @@ async def read_limited_body(
 
 
 def dashboard_cookie_secure(request: Request) -> bool:
-    forwarded_proto = (
-        request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip().lower()
-    )
-    return forwarded_proto == "https" or request.url.scheme == "https"
+    settings: Settings = request.app.state.settings
+    if settings.trust_forwarded_headers:
+        forwarded_proto = (
+            request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip().lower()
+        )
+        if forwarded_proto == "https":
+            return True
+    return request.url.scheme == "https"
 
 
 def is_dashboard_path(path: str) -> bool:
     return path == "/dashboard" or path.startswith("/dashboard/")
+
+
+async def enqueue_approval_or_manual_request(
+    store: BridgeStore,
+    mm: MediaManagerClient,
+    profile: BridgeProfile,
+    *,
+    media_type: MediaType,
+    external_id: int,
+    title: str,
+    seasons: list[int] | None,
+    search_requested: bool,
+    payload: dict[str, Any],
+    add_to_mediamanager: Callable[[MediaManagerClient, BridgeProfile, int], Awaitable[str]],
+) -> None:
+    """Shared enqueue flow for APPROVAL and MANUAL profile modes.
+
+    Movies pass seasons=None and no per-season candidates; shows pass their
+    monitored season list. Error responses, event types/messages, and the
+    MediaManager call order match the previous per-route branches exactly.
+    """
+    if profile.mode == ReleaseMode.APPROVAL:
+        item = await store_call(
+            store.upsert_queue_item,
+            media_type=media_type,
+            external_id=external_id,
+            title=title,
+            profile_id=profile.id,
+            profile_name=profile.name,
+            mode=profile.mode,
+            status="pending_approval",
+            seasons=seasons,
+            payload=payload,
+        )
+        ensure_queue_status(item, APPROVAL_ACCEPTED_STATUSES)
+        if item["status"] == "pending_approval":
+            await store_call(
+                store.add_event,
+                event_type="queue.created",
+                message=f"{media_type} request is pending bridge approval",
+                queue_id=item["id"],
+            )
+        return
+
+    item = await store_call(
+        store.upsert_queue_item,
+        media_type=media_type,
+        external_id=external_id,
+        title=title,
+        profile_id=profile.id,
+        profile_name=profile.name,
+        mode=profile.mode,
+        status="needs_release",
+        seasons=seasons,
+        payload=payload,
+    )
+    ensure_queue_status(item, MANUAL_ACCEPTED_STATUSES)
+    if item["status"] != "needs_release" or item.get("mediamanager_id"):
+        return
+    claimed = await store_call(
+        store.transition_queue_item,
+        item["id"],
+        from_status="needs_release",
+        to_status="download_claimed",
+    )
+    if claimed is None:
+        return
+    try:
+        media_uuid = await add_to_mediamanager(mm, profile, external_id)
+    except (MediaManagerError, httpx.TransportError) as exc:
+        # Transport failures here are ambiguous: the add may have landed
+        # upstream. Rolling the claim back is safe because a retry re-adds
+        # through the client's existing-title lookup instead of duplicating.
+        await store_call(
+            store.update_queue_item,
+            item["id"],
+            status="needs_release",
+            from_status="download_claimed",
+        )
+        await store_call(
+            store.add_event,
+            event_type="queue.add_failed",
+            message=str(exc) or exc.__class__.__name__,
+            queue_id=item["id"],
+        )
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            MEDIAMANAGER_REQUEST_FAILURE,
+        ) from exc
+    updated = await store_call(
+        store.update_queue_item,
+        item["id"],
+        status="needs_release",
+        mediamanager_id=media_uuid,
+        from_status="download_claimed",
+    )
+    if updated is None:
+        # The claim moved on (competing worker or stale-claim recovery). Keep a
+        # winner's MediaManager association; only attach ours when the item is
+        # back in needs_release without one.
+        current = await store_call(store.get_queue_item, item["id"])
+        if current.get("mediamanager_id"):
+            return
+        await store_call(
+            store.update_queue_item,
+            item["id"],
+            mediamanager_id=media_uuid,
+            from_status="needs_release",
+        )
+        return
+    item = updated
+    if search_requested:
+        try:
+            await refresh_candidates_for_item(store, mm, item, profile)
+        except MediaManagerError as exc:
+            await store_call(
+                store.add_event,
+                event_type="queue.candidate_refresh_failed",
+                message=str(exc),
+                queue_id=item["id"],
+            )
+    await store_call(
+        store.add_event,
+        event_type="queue.created",
+        message=f"{media_type} request is waiting for manual release selection",
+        queue_id=item["id"],
+    )
 
 
 async def add_movie_to_mediamanager(

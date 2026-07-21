@@ -5,9 +5,9 @@ param(
     [switch]$SkipLocalGuards,
     [switch]$CodexReviewConfirmed,
     [string]$CodeRabbitFixturePath = "",
-    [switch]$PrintCodeRabbitRunner,
-    [ValidateSet("", "native", "wsl", "docker")]
-    [string]$CodeRabbitRunner = ""
+    # Runner path: explicit parameter wins, then the environment variable,
+    # then the example default checkout. Other machines must override it.
+    [string]$CentralCodeRabbitRunner = $(if ($env:SCREENARR_CENTRAL_CODERABBIT_RUNNER) { $env:SCREENARR_CENTRAL_CODERABBIT_RUNNER } else { "D:\Projects\coderabbit\Invoke-CodeRabbit.ps1" })
 )
 
 $ErrorActionPreference = "Stop"
@@ -116,133 +116,6 @@ function Get-FindingSeverity {
     return "__unknown__"
 }
 
-function Convert-ToWslPath {
-    param([string]$Path)
-    $convertedPath = wsl -e wslpath -a $Path
-    if (-not $convertedPath) {
-        throw "could not convert path for WSL: $Path"
-    }
-    return $convertedPath.Trim()
-}
-
-function ConvertTo-BashQuoted {
-    param([string]$Value)
-    return "'" + $Value.Replace("'", "'\''") + "'"
-}
-
-function Get-WslCodeRabbitCommand {
-    param([string]$Command)
-    $wslRepoPath = Convert-ToWslPath $RepoPath
-    return "cd $(ConvertTo-BashQuoted $wslRepoPath) && export PATH=`"`$HOME/.local/bin:`$PATH`" && $Command"
-}
-
-function Get-CodeRabbitDockerImage {
-    return "screenarr-coderabbit-cli:local"
-}
-
-function Protect-LocalSecret {
-    param([string]$Value)
-    $redacted = $Value
-    foreach ($secretName in $ReviewGateSecretEnvNames) {
-        $secret = [Environment]::GetEnvironmentVariable($secretName)
-        if (-not [string]::IsNullOrWhiteSpace($secret)) {
-            $redacted = $redacted.Replace($secret, "[REDACTED_SECRET]")
-        }
-    }
-    return $redacted
-}
-
-function Build-CodeRabbitDockerImage {
-    $dockerfilePath = Join-Path $RepoPath "scripts/coderabbit.Dockerfile"
-    docker build -f $dockerfilePath -t (Get-CodeRabbitDockerImage) (Split-Path $dockerfilePath -Parent)
-    if ($LASTEXITCODE -ne 0) {
-        throw "CodeRabbit Docker image build failed with exit code $LASTEXITCODE"
-    }
-}
-
-function Complete-ProcessReadTask {
-    param([object]$Task)
-    if ($null -eq $Task) {
-        return
-    }
-    try {
-        $null = $Task.GetAwaiter().GetResult()
-    } catch {
-        # Best-effort cleanup for daemon probing; the caller decides availability.
-        Write-Verbose "Ignoring daemon probe stream cleanup failure."
-    }
-}
-
-function Test-DockerDaemonAvailable {
-    $dockerCommand = Get-Command docker -ErrorAction SilentlyContinue
-    if (-not $dockerCommand) {
-        return $false
-    }
-    $timeoutMilliseconds = 10000
-    $configuredTimeout = 0
-    if (
-        [int]::TryParse($env:SCREENARR_TEST_DOCKER_INFO_TIMEOUT_MS, [ref]$configuredTimeout) -and
-        $configuredTimeout -gt 0
-    ) {
-        $timeoutMilliseconds = $configuredTimeout
-    }
-
-    $process = [System.Diagnostics.Process]::new()
-    try {
-        $process.StartInfo.FileName = $dockerCommand.Source
-        $process.StartInfo.Arguments = "info"
-        $process.StartInfo.UseShellExecute = $false
-        $process.StartInfo.RedirectStandardOutput = $true
-        $process.StartInfo.RedirectStandardError = $true
-        if (-not $process.Start()) {
-            return $false
-        }
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit($timeoutMilliseconds)) {
-            $process.Kill()
-            $null = $process.WaitForExit(1000)
-            Complete-ProcessReadTask $stdoutTask
-            Complete-ProcessReadTask $stderrTask
-            return $false
-        }
-        Complete-ProcessReadTask $stdoutTask
-        Complete-ProcessReadTask $stderrTask
-        return $process.ExitCode -eq 0
-    } catch {
-        return $false
-    } finally {
-        $process.Dispose()
-    }
-}
-
-function Invoke-CodeRabbitDocker {
-    param([string]$Command)
-    if ([string]::IsNullOrWhiteSpace($env:CODERABBIT_API_KEY)) {
-        throw "CODERABBIT_API_KEY must be set locally to run CodeRabbit through Docker."
-    }
-    $workspaceMount = "${RepoPath}:/workspace:ro"
-    $dockerArgs = @(
-        "run",
-        "--rm",
-        "-e",
-        "CODERABBIT_API_KEY",
-        "--env",
-        "GIT_OPTIONAL_LOCKS=0",
-        "--env",
-        "HOME=/tmp/coderabbit-home",
-        "-v",
-        $workspaceMount,
-        "-w",
-        "/workspace",
-        (Get-CodeRabbitDockerImage),
-        "bash",
-        "-lc",
-        "mkdir -p `"`$HOME`" && export PATH=/opt/coderabbit/bin:`$PATH && coderabbit auth login --api-key `"`$CODERABBIT_API_KEY`" >/dev/null && git config --global --add safe.directory /workspace && $Command"
-    )
-    docker @dockerArgs
-}
-
 function Test-CodeRabbitOutput {
     param([string[]]$Lines)
 
@@ -301,58 +174,6 @@ function Test-CodeRabbitOutput {
     if ($criticalOrMajor -gt 0) {
         throw "CodeRabbit returned $criticalOrMajor critical/major issue(s)."
     }
-}
-
-function Test-CodeRabbitRunnerAvailable {
-    param([string]$Runner)
-    if ($Runner -eq "native") {
-        return [bool](Get-Command coderabbit -ErrorAction SilentlyContinue)
-    }
-    if ($Runner -eq "docker") {
-        if ([string]::IsNullOrWhiteSpace($env:CODERABBIT_API_KEY)) {
-            return $false
-        }
-        return Test-DockerDaemonAvailable
-    }
-    if ($Runner -eq "wsl") {
-        if (-not (Get-Command wsl -ErrorAction SilentlyContinue)) {
-            return $false
-        }
-        try {
-            wsl -e bash -lc (Get-WslCodeRabbitCommand "command -v coderabbit >/dev/null")
-        } catch {
-            $global:LASTEXITCODE = 1
-        }
-        return $LASTEXITCODE -eq 0
-    }
-    return $false
-}
-
-function Get-CodeRabbitRunner {
-    param(
-        [string]$RequestedRunner = "",
-        [bool]$WarnOnUnavailable = $true
-    )
-    if ($RequestedRunner) {
-        if (Test-CodeRabbitRunnerAvailable $RequestedRunner) {
-            return $RequestedRunner
-        }
-        if ($WarnOnUnavailable) {
-            Write-Warning "Requested CodeRabbit runner '$RequestedRunner' is unavailable."
-        }
-        return "missing"
-    }
-    foreach ($runner in @("native", "wsl", "docker")) {
-        if (Test-CodeRabbitRunnerAvailable $runner) {
-            return $runner
-        }
-    }
-    return "missing"
-}
-
-if ($PrintCodeRabbitRunner) {
-    Write-Output (Get-CodeRabbitRunner -RequestedRunner $CodeRabbitRunner -WarnOnUnavailable $false)
-    exit 0
 }
 
 if (-not $SkipLocalGuards) {
@@ -438,8 +259,7 @@ if (-not $SkipLocalChecks) {
     }
 }
 
-# SkipDockerBuild only skips the Screenarr app image; the Docker CodeRabbit runner
-# still builds when CodeRabbit selects or is given -CodeRabbitRunner docker.
+# SkipDockerBuild applies only to the Screenarr application image.
 if (-not $SkipDockerBuild) {
     Invoke-Step "Docker build" {
         docker build -t screenarr:local .
@@ -447,78 +267,33 @@ if (-not $SkipDockerBuild) {
 }
 
 if (-not $SkipCodeRabbit) {
-    New-Item -ItemType Directory -Force -Path ".review-gate" | Out-Null
     if ($CodeRabbitFixturePath) {
         $lines = Get-Content -LiteralPath $CodeRabbitFixturePath
         Test-CodeRabbitOutput $lines
     } else {
-        $runner = Get-CodeRabbitRunner -RequestedRunner $CodeRabbitRunner
-        if ($runner -eq "missing") {
-            throw "CodeRabbit CLI was not found natively, in WSL, or through Docker."
+        if (-not (Test-Path -LiteralPath $CentralCodeRabbitRunner -PathType Leaf)) {
+            throw "Central CodeRabbit runner is unavailable: $CentralCodeRabbitRunner"
         }
-        Invoke-Step "CodeRabbit auth" {
-            if ($runner -eq "native") {
-                coderabbit auth status --agent
-            } elseif ($runner -eq "docker") {
-                Build-CodeRabbitDockerImage
-                $authStderrPath = Join-Path ".review-gate" "coderabbit-auth.stderr"
-                Invoke-CodeRabbitDocker "coderabbit auth status --agent" 2> $authStderrPath
-                $authExitCode = $LASTEXITCODE
-                if (Test-Path -LiteralPath $authStderrPath) {
-                    $authStderrLines = Get-Content -LiteralPath $authStderrPath -Encoding UTF8
-                    if ($authStderrLines) {
-                        $redactedAuthStderrLines = @(
-                            $authStderrLines | ForEach-Object { Protect-LocalSecret $_ }
-                        )
-                        $redactedAuthStderrLines | Set-Content -LiteralPath $authStderrPath -Encoding UTF8
-                        $redactedAuthStderrLines | ForEach-Object { Write-Host $_ }
-                    }
-                }
-                if ($authExitCode -ne 0) {
-                    throw "CodeRabbit auth failed with exit code $authExitCode"
-                }
-            } else {
-                wsl -e bash -lc (Get-WslCodeRabbitCommand "coderabbit auth status --agent")
-            }
+        Write-Host "==> quota-aware CodeRabbit review"
+        $runnerParameters = @{
+            Repository = $RepoPath
+            Uncommitted  = $true
+            Config       = (Join-Path $RepoPath ".coderabbit.yaml")
         }
-        Invoke-Step "CodeRabbit review" {
-            $outputPath = Join-Path ".review-gate" "coderabbit.ndjson"
-            $stderrPath = Join-Path ".review-gate" "coderabbit.stderr"
-            if ($runner -eq "native") {
-                $lines = coderabbit review --agent -t uncommitted -c AGENTS.md 2> $stderrPath
-            } elseif ($runner -eq "docker") {
-                $reviewCommand = "coderabbit review --agent -t uncommitted -c AGENTS.md"
-                $lines = Invoke-CodeRabbitDocker $reviewCommand 2> $stderrPath
-            } else {
-                $wslOutputPath = Convert-ToWslPath (Join-Path $RepoPath $outputPath)
-                $wslStderrPath = Convert-ToWslPath (Join-Path $RepoPath $stderrPath)
-                $reviewCommand = @(
-                    "coderabbit review --agent -t uncommitted -c AGENTS.md",
-                    "> $(ConvertTo-BashQuoted $wslOutputPath)",
-                    "2> $(ConvertTo-BashQuoted $wslStderrPath)"
-                ) -join " "
-                wsl -e bash -lc (Get-WslCodeRabbitCommand $reviewCommand)
-                if (Test-Path -LiteralPath $outputPath) {
-                    $lines = Get-Content -LiteralPath $outputPath -Encoding UTF8
-                } else {
-                    $lines = @()
-                }
+        $global:LASTEXITCODE = 0
+        & $CentralCodeRabbitRunner @runnerParameters
+        $centralExitCode = $LASTEXITCODE
+        if ($centralExitCode -ne 0) {
+            # Normalized exit codes: 2 = review completed with critical/major
+            # findings, 3 = deferred (quota/replay policy), 4 = review failure.
+            $originalExitCode = $centralExitCode
+            if ($centralExitCode -notin @(2, 3, 4)) {
+                $centralExitCode = 4
             }
-            $exitCode = $LASTEXITCODE
-            $lines = @($lines | ForEach-Object { Protect-LocalSecret $_ })
-            $lines | Set-Content -LiteralPath $outputPath -Encoding UTF8
-            if (Test-Path -LiteralPath $stderrPath) {
-                $stderrLines = Get-Content -LiteralPath $stderrPath -Encoding UTF8
-                if ($stderrLines) {
-                    $redactedStderrLines = @($stderrLines | ForEach-Object { Protect-LocalSecret $_ })
-                    $redactedStderrLines | Set-Content -LiteralPath $stderrPath -Encoding UTF8
-                    $redactedStderrLines | ForEach-Object { Write-Host $_ }
-                }
-            }
-            if ($exitCode -ne 0) {
-                throw "CodeRabbit review failed with exit code $exitCode"
-            }
-            Test-CodeRabbitOutput $lines
+            [Console]::Error.WriteLine(
+                "quota-aware CodeRabbit review failed with exit code $centralExitCode (runner exit code $originalExitCode)"
+            )
+            exit $centralExitCode
         }
     }
 }

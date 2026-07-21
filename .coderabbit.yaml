@@ -1,0 +1,102 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+inheritance: true
+language: en-US
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  high_level_summary_in_walkthrough: false
+  review_status: true
+  review_details: false
+  commit_status: true
+  fail_commit_status: false
+  collapse_walkthrough: true
+  changed_files_summary: true
+  sequence_diagrams: false
+  estimate_code_review_effort: true
+  assess_linked_issues: true
+  related_issues: true
+  related_prs: true
+  suggested_labels: true
+  auto_apply_labels: false
+  suggested_reviewers: true
+  auto_assign_reviewers: false
+  in_progress_fortune: false
+  poem: false
+  enable_prompt_for_ai_agents: true
+  abort_on_close: true
+  disable_cache: false
+
+  auto_review:
+    enabled: false
+    description_keyword: ""
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 1
+    ignore_title_keywords:
+      - WIP
+      - DO NOT MERGE
+      - "[skip review]"
+    labels:
+      - review-ready
+      - "!do-not-review"
+    drafts: false
+    ignore_usernames:
+      - "dependabot[bot]"
+      - "renovate[bot]"
+      - "github-actions[bot]"
+
+  finishing_touches:
+    docstrings:
+      enabled: true
+    unit_tests:
+      enabled: true
+    simplify:
+      enabled: true
+    autofix:
+      enabled: true
+
+  pre_merge_checks:
+    override_requested_reviewers_only: false
+    docstrings:
+      mode: warning
+      threshold: 80
+    title:
+      mode: warning
+      requirements: "Use a concise, descriptive title that states the user-visible or operational change."
+    description:
+      mode: warning
+    issue_assessment:
+      mode: warning
+
+chat:
+  art: false
+  allow_non_org_members: false
+  auto_reply: false
+
+knowledge_base:
+  opt_out: false
+  web_search:
+    enabled: true
+  code_guidelines:
+    enabled: true
+  learnings:
+    scope: local
+    approval_delay: 7
+  issues:
+    scope: local
+  pull_requests:
+    scope: local
+  automatic_repository_linking: false
+
+issue_enrichment:
+  auto_enrich:
+    enabled: false
+  planning:
+    enabled: true
+  auto_planning:
+    enabled: false
+    labels: []
+  labeling:
+    auto_apply_labels: false
+    labeling_instructions: []

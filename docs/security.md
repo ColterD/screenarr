@@ -31,6 +31,34 @@ dashboard sessions.
 `BRIDGE_API_KEY` is separate. It authenticates OnScreen's Arr-service requests
 and dashboard login attempts, but it does not sign dashboard cookies.
 
+Dashboard and login responses carry defense-in-depth headers: a
+`Content-Security-Policy` that allows only the inline styles the server-rendered
+pages need (no scripts), `X-Frame-Options: DENY`, `X-Content-Type-Options:
+nosniff`, `Referrer-Policy: no-referrer`, and `Cache-Control: no-store`.
+
+Dashboard logins are throttled per client IP: after 5 consecutive failed
+attempts, further logins from that IP are rejected with HTTP 429 for 60
+seconds. A successful login resets the counter. The throttle is in-memory and
+requires single-worker deployment — the reference Dockerfile/Compose run a
+single uvicorn worker by design (SQLite is single-writer too), and a restart
+clears the counters. Multi-replica deployments need shared atomic storage for
+throttle state instead. It applies only to `/dashboard/login`; the
+Arr-compatible API-key endpoints used by OnScreen are not throttled.
+
+## Reverse Proxy And Forwarded Headers
+
+By default (`TRUST_FORWARDED_HEADERS=false`) Screenarr ignores client-supplied
+`X-Forwarded-Host` and `X-Forwarded-Proto`. Dashboard CSRF origin checks and
+the session-cookie `Secure` flag are derived from the direct request URL, so a
+directly exposed bridge cannot be tricked by spoofed forwarded headers.
+
+Set `TRUST_FORWARDED_HEADERS=true` only when the bridge sits behind a trusted
+reverse proxy that terminates TLS and sets — or strips and re-sets —
+`X-Forwarded-Host` and `X-Forwarded-Proto` on every request. With the setting
+on, Screenarr trusts those headers for the CSRF origin check and for marking
+the dashboard cookie `Secure`. Never enable it on a directly exposed bridge:
+any client could then spoof the headers and weaken both protections.
+
 ## OnScreen Webhook
 
 The optional OnScreen webhook receiver is disabled unless

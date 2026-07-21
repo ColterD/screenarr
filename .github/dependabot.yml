@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # Keep Dockerfile base-image digests (uv, python:3.12-slim) current.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  # Keep GitHub Actions pinned SHAs current.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

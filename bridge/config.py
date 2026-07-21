@@ -100,6 +100,7 @@ class Settings(BaseSettings):
     auto_download_full_series: bool = Field(default=False, alias="AUTO_DOWNLOAD_FULL_SERIES")
     max_auto_tv_seasons: int = Field(default=3, alias="MAX_AUTO_TV_SEASONS")
     enable_dashboard: bool = Field(default=False, alias="ENABLE_DASHBOARD")
+    trust_forwarded_headers: bool = Field(default=False, alias="TRUST_FORWARDED_HEADERS")
     screenarr_data_path: Path = Field(
         default=Path("/data/screenarr.db"),
         alias="SCREENARR_DATA_PATH",
@@ -121,6 +122,11 @@ class Settings(BaseSettings):
         default=300,
         alias="MEDIAMANAGER_RECONCILE_INTERVAL_SECONDS",
         ge=30,
+    )
+    reconcile_grace_seconds: int = Field(
+        default=900,
+        alias="RECONCILE_GRACE_SECONDS",
+        ge=0,
     )
     mediamanager_config_path: Path | None = Field(default=None, alias="MEDIAMANAGER_CONFIG_PATH")
 

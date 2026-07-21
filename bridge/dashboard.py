@@ -433,3 +433,43 @@ def format_size(value: object) -> str:
     if size >= 1024:
         return f"{size / 1024:.1f} KiB"
     return f"{int(size)} B"
+
+
+def dashboard_login_html() -> str:
+    return """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Screenarr Login</title>
+  <style>
+    :root { color-scheme: dark; --bg: #111315; --line: #2b3137; --text: #eef2f5; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    form { width: min(360px, calc(100vw - 32px)); display: grid; gap: 12px; }
+    label { font-weight: 700; }
+    input, button {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font: inherit;
+    }
+    button { cursor: pointer; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <form method="post" action="/dashboard/login">
+    <label for="api_key">Screenarr API key</label>
+    <input id="api_key" name="api_key" type="password" autocomplete="current-password" required>
+    <button type="submit">Open dashboard</button>
+  </form>
+</body>
+</html>"""

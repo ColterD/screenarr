@@ -12,7 +12,7 @@ auth, queue, webhook, reconciliation, validation, or MediaManager API change.
 | Arr-compatible endpoints | `test_arr_api.py` | Auth, lookup, service metadata, MediaManager request paths. |
 | Queue and dashboard flows | `test_queue_and_validation.py` | Largest behavioral suite; use existing helpers. |
 | Webhook/security flows | `test_queue_and_validation.py` | Signature, replay, dashboard session, availability hints. |
-| Review gate behavior | `test_review_gate_script.py` | Fixture-driven PowerShell/CodeRabbit parsing tests. |
+| Review gate behavior | `test_review_gate_script.py` | Central-runner delegation and fail-closed fixture parsing. |
 | CodeRabbit fixtures | `fixtures/*.ndjson` | One fixture per parser outcome; keep them small. |
 
 ## CONVENTIONS
@@ -23,8 +23,9 @@ auth, queue, webhook, reconciliation, validation, or MediaManager API change.
   duplicated flows.
 - For webhook tests, sign payloads with `sign_webhook` and keep test values
   obviously non-secret.
-- For review-gate tests, add an NDJSON fixture first, then assert the script
-  exit behavior.
+- For parser changes, add an NDJSON fixture first and assert the script exit
+  behavior. For adapter changes, use a fake central runner and assert one
+  explicit-scope invocation.
 - Assert both stored queue state and API response when testing transitions.
 - Preserve idempotency coverage for duplicate movie and show requests.
 
