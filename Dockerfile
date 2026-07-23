@@ -15,14 +15,15 @@ WORKDIR /app
 COPY --from=uv /uv /uvx /bin/
 
 # Install locked third-party dependencies first so this layer caches
-# independently of application source changes.
+# independently of application source changes. --no-cache keeps uv's
+# package cache out of the final image.
 COPY pyproject.toml uv.lock ./
-RUN uv sync --locked --no-dev --no-install-project
+RUN uv sync --locked --no-dev --no-install-project --no-cache
 
 # Install the project itself from the same lockfile resolution.
 COPY README.md ./
 COPY bridge ./bridge
-RUN uv sync --locked --no-dev
+RUN uv sync --locked --no-dev --no-cache
 
 # Run as a dedicated non-root user. /data holds the SQLite state file
 # (SCREENARR_DATA_PATH, default /data/screenarr.db), so it must be writable.

@@ -1665,6 +1665,10 @@ def download_submitted_past_grace(item: Mapping[str, Any], grace_seconds: float)
         submitted_at = datetime.fromisoformat(updated_at)
     except ValueError:
         return True
+    if submitted_at.tzinfo is None:
+        # Naive timestamps are stored in UTC; normalize before comparing
+        # against the aware current time.
+        submitted_at = submitted_at.replace(tzinfo=UTC)
     return (datetime.now(UTC) - submitted_at).total_seconds() >= grace_seconds
 
 

@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import sqlite3
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ from bridge.main import (
     MAX_WEBHOOK_BODY_BYTES,
     AutoDownloadAmbiguity,
     create_app,
+    download_submitted_past_grace,
     mark_download_failed,
     mediamanager_reconcile_loop,
     mediamanager_reconcile_summary,
@@ -3980,6 +3982,22 @@ def test_settings_include_reconcile_grace_default(tmp_path: Path) -> None:
 
     assert settings.reconcile_grace_seconds == 900
     assert custom.reconcile_grace_seconds == 0
+
+
+def test_download_submitted_past_grace_timestamp_handling() -> None:
+    now_utc = datetime.now(UTC)
+    old_aware = (now_utc - timedelta(seconds=1200)).isoformat()
+    old_naive = (now_utc - timedelta(seconds=1200)).replace(tzinfo=None).isoformat()
+    fresh_naive = (now_utc - timedelta(seconds=10)).replace(tzinfo=None).isoformat()
+
+    # Aware and naive (UTC-stored) timestamps both compare correctly.
+    assert download_submitted_past_grace({"updated_at": old_aware}, 900)
+    assert download_submitted_past_grace({"updated_at": old_naive}, 900)
+    assert not download_submitted_past_grace({"updated_at": fresh_naive}, 900)
+    # Missing or corrupt timestamps fail open to recovery; grace 0 always bounces.
+    assert download_submitted_past_grace({}, 900)
+    assert download_submitted_past_grace({"updated_at": "not-a-date"}, 900)
+    assert download_submitted_past_grace({"updated_at": fresh_naive}, 0)
 
 
 def test_reconcile_holds_fresh_submission_during_grace_period(tmp_path: Path) -> None:

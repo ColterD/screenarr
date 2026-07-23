@@ -96,9 +96,12 @@ docker build -t screenarr:local .
 powershell -ExecutionPolicy Bypass -File scripts/review-gate.ps1 -CodexReviewConfirmed
 ```
 
-The review gate is a thin adapter to the central CodeRabbit runner configured
-via the gate's `-CentralCodeRabbitRunner` parameter (default: a central checkout
-outside this repo). That central runner is the only CodeRabbit invocation owner;
+The review gate is a thin adapter to the central CodeRabbit runner. The runner
+path resolves from `-CentralCodeRabbitRunner`, then the
+`SCREENARR_CENTRAL_CODERABBIT_RUNNER` environment variable, then a central
+checkout outside this repo; on machines without that checkout, set the
+environment variable or pass the parameter explicitly. That central runner is
+the only CodeRabbit invocation owner;
 it selects the explicit uncommitted scope, enforces quota and replay policy, and
 uses the authenticated Debian CLI without repository credentials or Docker
 fallbacks.
