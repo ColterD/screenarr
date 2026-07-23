@@ -1,80 +1,102 @@
-# .coderabbit.yaml — CodeRabbit starter config (workbench template)
-#
-# Copy to the ROOT of the adopting repository and commit it. The workbench
-# wrapper (scripts/Invoke-CodeRabbitReview.ps1) refuses to run without it,
-# and the central runner passes it verbatim to the CodeRabbit CLI.
-#
-# Requirements from the central runner (D:\Projects\coderabbit):
-# - The file must live beneath D:\Projects (canonical path, after resolving
-#   junctions/symlinks). Repo-root placement satisfies this automatically.
-# - Contents are hashed into the review fingerprint: editing this file makes
-#   the next review a fresh analysis, not a replay. That is intended —
-#   config changes SHOULD trigger re-review.
-# - No secrets in this file. It is hashed and copied, never redacted.
-#
-# Schema reference: https://docs.coderabbit.ai (Configuration Reference).
-# Editor completion via the first line below.
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
-
-language: "en-US"
-early_access: false
+inheritance: true
+language: en-US
 
 reviews:
-  # "chill" = fewer, higher-signal comments; "assertive" = flags more.
-  # Start chill; go assertive on security-critical repos.
-  profile: "chill"
-
-  # Let reviewers request changes through CodeRabbit's review status.
+  profile: chill
   request_changes_workflow: false
-
-  # Walkthrough comment at the top of each review.
   high_level_summary: true
-
-  # The joke poem. Off.
-  poem: false
-
-  # Post a review status check on the PR.
+  high_level_summary_in_walkthrough: false
   review_status: true
-
-  collapse_walkthrough: false
-
-  # Never review generated/vendored/lock content.
-  path_filters:
-    - "!**/*.lock"
-    - "!**/package-lock.json"
-    - "!**/pnpm-lock.yaml"
-    - "!**/yarn.lock"
-    - "!**/dist/**"
-    - "!**/build/**"
-    - "!**/node_modules/**"
-    - "!**/vendor/**"
-    - "!**/coverage/**"
-    - "!**/*.min.js"
-    - "!**/*.generated.*"
+  review_details: false
+  commit_status: true
+  fail_commit_status: false
+  collapse_walkthrough: true
+  changed_files_summary: true
+  sequence_diagrams: false
+  estimate_code_review_effort: true
+  assess_linked_issues: true
+  related_issues: true
+  related_prs: true
+  suggested_labels: true
+  auto_apply_labels: false
+  suggested_reviewers: true
+  auto_assign_reviewers: false
+  in_progress_fortune: false
+  poem: false
+  enable_prompt_for_ai_agents: true
+  abort_on_close: true
+  disable_cache: false
 
   auto_review:
-    enabled: true
-    # Don't burn reviews on draft PRs.
-    drafts: false
-    # Skip noisy title prefixes.
+    enabled: false
+    description_keyword: ""
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 1
     ignore_title_keywords:
-      - "WIP"
+      - WIP
+      - DO NOT MERGE
       - "[skip review]"
+    labels:
+      - review-ready
+      - "!do-not-review"
+    drafts: false
+    ignore_usernames:
+      - "dependabot[bot]"
+      - "renovate[bot]"
+      - "github-actions[bot]"
 
-  # Per-path review focus. Add repo-specific rules here; keep instructions
-  # concrete (what to flag), not aspirational ("write clean code").
-  path_instructions:
-    - path: "**/*.ps1"
-      instructions: |
-        Flag non-idempotent operations, missing error handling around
-        external commands, and any secret-looking literal. PowerShell
-        variables are case-insensitive — flag locals that differ from a
-        parameter only by case.
-    - path: "**/tests/**"
-      instructions: |
-        Verify fixtures are synthetic (no real-looking credentials) and
-        that tests assert behavior, not implementation details.
+  finishing_touches:
+    docstrings:
+      enabled: true
+    unit_tests:
+      enabled: true
+    simplify:
+      enabled: true
+    autofix:
+      enabled: true
+
+  pre_merge_checks:
+    override_requested_reviewers_only: false
+    docstrings:
+      mode: warning
+      threshold: 80
+    title:
+      mode: warning
+      requirements: "Use a concise, descriptive title that states the user-visible or operational change."
+    description:
+      mode: warning
+    issue_assessment:
+      mode: warning
 
 chat:
-  # Reply automatically to review-comment threads.
-  auto_reply: true
+  art: false
+  allow_non_org_members: false
+  auto_reply: false
+
+knowledge_base:
+  opt_out: false
+  web_search:
+    enabled: true
+  code_guidelines:
+    enabled: true
+  learnings:
+    scope: local
+    approval_delay: 7
+  issues:
+    scope: local
+  pull_requests:
+    scope: local
+  automatic_repository_linking: false
+
+issue_enrichment:
+  auto_enrich:
+    enabled: false
+  planning:
+    enabled: true
+  auto_planning:
+    enabled: false
+    labels: []
+  labeling:
+    auto_apply_labels: false
+    labeling_instructions: []
